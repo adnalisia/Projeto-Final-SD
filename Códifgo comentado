@@ -1,0 +1,172 @@
+module safecrackpro_beta_fsm (
+    input  logic        clk,        // Entrada de clock, essencial para a sincronização da FSM.
+    input  logic        rst,        // Entrada de reset assíncrono. Quando rst é 1, a FSM volta ao estado inicial.
+    input  logic [3:0]  btn,        // Entradas dos botões, de 4 bits. O valor '1111' é usado como valor padrão para indicar que nenhum botão foi pressionado.
+    output logic        unlocked    // Saída que indica que o cofre foi destrancado. '1' significa desbloqueado.
+);
+
+    // One-hot encoding com 17 estados
+    // A codificação 'one-hot' usa um bit para cada estado. Isso simplifica a lógica de estado,
+    // mas consome mais registradores.
+    typedef enum logic [16:0] {
+        S0  = 17'b00000000000000001,  // S0: Estado inicial. O usuário define o 1º dígito da senha.
+        S1  = 17'b00000000000000010,  // S1: O usuário define o 2º dígito da senha.
+        S2  = 17'b00000000000001000,  // S2: O usuário define o 3º e último dígito da senha.
+        T00 = 17'b00000000000010000,  // T00: Estado de Tentativa 0, 0 erros. Aguardando o 1º dígito da senha.
+        T01 = 17'b00000000000100000,  // T01: Tentativa 0, 1 erro.
+        T02 = 17'b00000000001000000,  // T02: Tentativa 0, 2 erros.
+        T10 = 17'b00000000010000000,  // T10: Tentativa 1, 0 erros. Aguardando o 2º dígito da senha.
+        T11 = 17'b00000000100000000,  // T11: Tentativa 1, 1 erro.
+        T12 = 17'b00000001000000000,  // T12: Tentativa 1, 2 erros.
+        T20 = 17'b00000010000000000,  // T20: Tentativa 2, 0 erros. Aguardando o 3º dígito da senha.
+        T21 = 17'b00000100000000000,  // T21: Tentativa 2, 1 erro.
+        T22 = 17'b00001000000000000,  // T22: Tentativa 2, 2 erros.
+        B0  = 17'b00010000000000000,  // B0: Bloqueio. 3 erros consecutivos na tentativa 0.
+        B1  = 17'b00100000000000000,  // B1: Bloqueio. 3 erros consecutivos na tentativa 1.
+        B2  = 17'b01000000000000000,  // B2: Bloqueio. 3 erros consecutivos na tentativa 2.
+        Unl = 17'b10000000000000000   // Unl: Estado de desbloqueio. A senha está correta.
+    } state_t;
+
+    state_t state, next;             // 'state' é o estado atual, 'next' é o próximo estado.
+    logic [28:0] counter;            // Um contador de 29 bits. O comentário diz que é para 500 milhões, mas não é usado no código fornecido.
+    
+    // Variáveis internas da FSM.
+    logic [3:0] user_passcode[2:0];  // Um array para armazenar a senha de 3 dígitos (cada dígito de 4 bits).
+    logic [3:0] entered_code;        // Não utilizada no código.
+    logic [3:0] error_count;         // Não utilizada no código.
+
+    // A FSM é implementada em duas partes principais:
+    // 1. O bloco 'always_ff' para registrar o estado e a senha (lógica sequencial).
+    // 2. O bloco 'always_comb' para a lógica de transição entre estados (lógica combinacional).
+
+    // ---
+    ### Lógica Sequencial (always_ff)
+
+    Este bloco é ativado na borda de subida do clock (`posedge clk`). Ele gerencia as mudanças de estado e o armazenamento da senha.
+
+    ```verilog
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            state <= S0;             // Reset: volta para o estado inicial S0.
+            counter <= 0;            // Reset: zera o contador.
+            entered_code <= 4'b0000; // Reset: zera o código inserido.
+            user_passcode[0] <= 4'b1111; // Reset: a senha é inicializada com o valor '1111'
+            user_passcode[1] <= 4'b1111; // para indicar que ainda não foi definida.
+            user_passcode[2] <= 4'b1111;
+        end
+        else begin
+            state <= next;           // Em cada ciclo de clock, o estado atual se torna o próximo estado calculado.
+
+            case (state)
+                S0: user_passcode[0] <= btn; // No estado S0, o primeiro dígito da senha é capturado.
+                S1: user_passcode[1] <= btn; // No estado S1, o segundo dígito é capturado.
+                S2: user_passcode[2] <= btn; // No estado S2, o terceiro dígito é capturado.
+                default: ;               // Em qualquer outro estado, nada acontece com a senha.
+            endcase
+        end
+    end
+    ```
+
+    ---
+    ### Lógica Combinacional (always_comb)
+
+    Este bloco é ativado sempre que qualquer uma de suas entradas muda. Ele define o próximo estado (`next`) com base no estado atual (`state`) e na entrada `btn`.
+
+    ```verilog
+    always_comb begin
+        next = state; // O próximo estado é, por padrão, o estado atual. Isso evita 'latch'.
+
+        case (state)
+            S0: begin
+                // Se a senha foi definida (botão pressionado), avança para o próximo estado.
+                if (user_passcode[0] != 4'b1111)
+                    next = S1;
+            end
+            S1: begin
+                // Se o segundo dígito foi definido, avança para o próximo estado.
+                if (user_passcode[1] != 4'b1111)
+                    next = S2;
+            end
+            S2: begin
+                // Se o terceiro dígito foi definido, o sistema está pronto para a primeira tentativa (T00).
+                if (user_passcode[2] != 4'b1111)
+                    next = T00;
+            end
+
+            // Lógica para as tentativas (T) e bloqueio (B)
+            // Cada estado de tentativa verifica se o dígito inserido ('btn') corresponde ao dígito da senha.
+            // Se for igual, avança para o próximo dígito. Se for diferente, avança para um estado de erro.
+
+            // Tentativa 0
+            T00: begin
+                if (btn != 4'b1111) begin
+                    if (btn == user_passcode[0])
+                        next = T10; // Acertou, avança para a próxima tentativa (dígito 1).
+                    else
+                        next = T01; // Errou, avança para o próximo estado de erro.
+                end
+            end
+            // Os estados T01 e T02 seguem a mesma lógica, contando 1 e 2 erros, respectivamente.
+            // A cada erro, o próximo estado de erro é selecionado.
+            T01: begin
+                if (btn != 4'b1111) begin
+                    if (btn == user_passcode[0])
+                        next = T10;
+                    else
+                        next = T02;
+                end
+            end
+            T02: begin
+                if (btn != 4'b1111) begin
+                    if (btn == user_passcode[0])
+                        next = T10;
+                    else
+                        next = B0; // 3 erros consecutivos, o cofre é bloqueado (estado B0).
+                end
+            end
+            // A mesma lógica de acerto/erro se aplica aos outros blocos de tentativas:
+            // Tentativa 1 (estados T10, T11, T12) para o 2º dígito da senha.
+            T10: begin
+                if (btn != 4'b1111) begin
+                    if (btn == user_passcode[1])
+                        next = T20; // Acertou o 2º dígito, avança para o 3º.
+                    else
+                        next = T11;
+                end
+            end
+            // Tentativa 2 (estados T20, T21, T22) para o 3º dígito da senha.
+            T20: begin
+                if (btn != 4'b1111) begin
+                    if (btn == user_passcode[2])
+                        next = Unl; // Acertou o 3º dígito, desbloqueia o cofre.
+                    else
+                        next = T21;
+                end
+            end
+            
+            // Os estados B0, B1 e B2 representam o bloqueio, e não há transição para 'unl'.
+            // O código original possui um erro: o estado B0, B1 e B2 transicionam
+            // para T00, T10 e T20, respectivamente. Isso significa que o cofre é
+            // "desbloqueado" e retorna a um estado de tentativa. Geralmente,
+            // um bloqueio exigiria um reset para voltar ao estado inicial.
+            B0: next = T00;
+            B1: next = T10;
+            B2: next = T20;
+
+            default: next = S0; // Se houver um estado inválido, volta para o estado inicial S0.
+        endcase
+    end
+    ```
+
+    ---
+    ### Lógica de Saída (always_comb)
+
+    Define a saída do módulo. A saída `unlocked` será `1` apenas quando a FSM estiver no estado de desbloqueio (`Unl`).
+
+    ```verilog
+    always_comb begin
+        unlocked = (state == Unl); // unlocked é '1' se o estado atual for 'Unl'.
+    end
+    ```
+
+endmodule
